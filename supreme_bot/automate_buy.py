@@ -1,137 +1,250 @@
 import os
-import random
 import time
 import tempfile
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException
+from queue import Queue
+import random
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
-# Constants
-CHROMEDRIVER_PATH = os.path.join(os.path.dirname(__file__), "./chromedriver.exe")
+# --- Constants / Globals ---
 TEMP_DIR = tempfile.mkdtemp()
+results_queue = Queue()
 
-# Chrome Options Setup
-options = webdriver.ChromeOptions()
-options.add_argument("--disable-gpu")
-options.add_argument("--no-sandbox")
-options.add_argument("--disable-dev-shm-usage")
-options.add_argument("--disable-blink-features=AutomationControlled")
-options.add_argument("--window-size=1920,1080")
-options.add_argument("--disable-extensions")
-options.add_argument("--disable-infobars")
-options.add_argument("--disable-browser-side-navigation")
-options.add_argument("--disable-cookies")
-options.add_argument("--disable-site-isolation-trials")
-options.add_argument("--disable-web-security")
-options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.6668.71 Safari/537.36")
-options.add_argument(f"user-data-dir={TEMP_DIR}")
+# --- Browser / Context setup ---
+def create_context(p):
+    """
+    Creates a Chromium persistent context so cookies/login can persist between runs.
+    Adjust headless as needed. Configure user agent, viewport, etc. here.
+    """
+    context = p.chromium.launch_persistent_context(
+        user_data_dir=TEMP_DIR,
+        headless=False,
+        args=[
+            "--disable-gpu",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-extensions",
+            "--disable-blink-features=AutomationControlled",
+            "--window-size=1920,1080",
+        ],
+        user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/129.0.6668.71 Safari/537.36"
+        ),
+        viewport={"width": 1920, "height": 1080},
+        locale="en-US",
+        timezone_id="America/Chicago",
+        extra_http_headers={"DNT": "1", "Accept-Language": "en-US,en;q=0.9"},
+    )
+    return context
 
-# WebDriver Initialization
-driver = webdriver.Chrome(options=options, service=Service(CHROMEDRIVER_PATH))
-
-
-# Helper Functions
-def detect_captcha():
-    """Detects if a CAPTCHA is present on the page."""
+# --- CAPTCHA helpers (human-in-the-loop only) ---
+def detect_captcha(page):
+    """Example heuristic: look for a recaptcha iframe. Adapt for your own site."""
     try:
-        driver.find_element(By.XPATH, "//iframe[contains(@src, 'recaptcha')]")
-        return True
-    except NoSuchElementException:
+        iframe = page.frame_locator("iframe[src*='recaptcha']").first
+        return iframe.is_visible(timeout=1000)
+    except PWTimeout:
+        return False
+    except Exception:
         return False
 
-
-def wait_for_captcha():
-    """Waits for the user to solve the CAPTCHA."""
-    print("CAPTCHA detected. Please solve it, then press Enter to continue...")
+def wait_for_captcha(page):
+    print("CAPTCHA detected. Please solve it in the browser window, then press Enter...")
     input("Press Enter once you've solved the CAPTCHA.")
-    while detect_captcha():
-        print("Waiting for CAPTCHA to be solved...")
+    # poll briefly to confirm it’s gone
+    for _ in range(10):
+        if not detect_captcha(page):
+            break
+        print("Still seeing CAPTCHA... waiting...")
         time.sleep(3)
 
+def captcha_check(page):
+    if detect_captcha(page):
+        wait_for_captcha(page)
 
-def captcha_check():
-    """Checks and handles CAPTCHA if detected."""
-    if detect_captcha():
-        wait_for_captcha()
+# --- State detection helpers ---
+def is_queue_state(page):
+    try:
+        content_lower = page.inner_text("body").lower()
+        queue_indicators = ["queue", "waiting room", "high traffic", "please wait"]
+        return any(indicator in content_lower for indicator in queue_indicators)
+    except Exception:
+        return False
 
+def is_item_visible(page, keywords):
+    try:
+        image = page.locator(f"img[alt*='{keywords}']").first
+        return image.is_visible(timeout=3000)
+    except PWTimeout:
+        return False
+    except Exception:
+        return False
 
-def add_item_to_cart(keywords, size):
+# --- Monitoring for drop ---
+def wait_for_drop(page, keywords):
     """
-    Handles the process of finding an item, optionally selecting its size, 
-    adding it to the cart, and waiting for confirmation before returning.
+    Monitors the page for the three states:
+    - QUEUE: Wait gently without spamming reloads.
+    - PRE-DROP: Refresh with jitter.
+    - LIVE: Item visible, proceed.
+    """
+    while True:
+        try:
+            # Initial load or reload
+            page.reload(wait_until="networkidle", timeout=30000)
+            captcha_check(page)
+
+            if is_queue_state(page):
+                print("QUEUE state detected. Waiting gently...")
+                queue_start = time.time()
+                while is_queue_state(page):
+                    if time.time() - queue_start > 300:  # 5 min stuck timeout
+                        print("Stuck in queue too long, forcing reload...")
+                        break
+                    time.sleep(random.uniform(5, 10))  # Check every 5-10s without reload
+                continue  # After exiting queue loop, reload to confirm state
+
+            if is_item_visible(page, keywords):
+                print("LIVE state detected. Item visible!")
+                return True
+
+            else:
+                print("PRE-DROP state. Refreshing with jitter...")
+                time.sleep(random.uniform(5, 15))
+
+        except PWTimeout:
+            print("Timeout during monitoring, retrying...")
+            time.sleep(5)
+        except Exception as e:
+            print(f"Error during monitoring: {e}")
+            time.sleep(10)
+
+# --- Core actions (use on sites you own or have permission to test) ---
+def add_item_to_cart(page, keywords: str, size: str) -> bool:
+    """
+    Example logic: find a product card by alt text or title containing keywords,
+    open it, select a size (if any), and click Add to Cart.
+    Replace selectors with your site’s selectors.
     """
     try:
-        # Wait for the page to fully load
-        WebDriverWait(driver, 20).until(
-            lambda d: d.execute_script('return document.readyState') == 'complete'
-        )
-        image = WebDriverWait(driver, 300).until(
-            EC.element_to_be_clickable((By.XPATH, f"//img[@alt='{keywords}']"))
-        )
-        image.click()
-        print(f"Item '{keywords}' selected.")
+        # Ensure initial load
+        page.wait_for_load_state("networkidle", timeout=30000)
 
-        # Check if size selection is required
-        if size != "One Size":
+        # Search for an image by partial alt text match
+        # (Prefer data-testid or stable attributes on your site)
+        deadline = time.time() + 300  # Extended to 5 min for resilience
+        found = False
+
+        while time.time() < deadline:
+            if is_queue_state(page):
+                print("QUEUE detected during ATC. Waiting...")
+                queue_start = time.time()
+                while is_queue_state(page):
+                    if time.time() - queue_start > 300:
+                        print("Stuck in queue during ATC, reloading...")
+                        break
+                    time.sleep(random.uniform(5, 10))
+                page.reload(wait_until="networkidle", timeout=30000)
+                continue
+
             try:
-                WebDriverWait(driver, 5).until(
-                    EC.element_to_be_clickable((By.XPATH, '//*[@id="MainContent"]/div[2]/div/div[2]/section/div[1]/div/select'))
-                )
-                size_selector = driver.find_element(By.XPATH, '//*[@id="MainContent"]/div[2]/div/div[2]/section/div[1]/div/select')
-                size_selector.click()
-                time.sleep(0.5)
-                Select(size_selector).select_by_visible_text(size)
-                print(f"Size '{size}' selected for '{keywords}'.")
+                image = page.locator(f"img[alt*='{keywords}']").first
+                if image.is_visible():
+                    image.click()
+                    print(f"Item '{keywords}' selected.")
+                    found = True
+                    break
+            except PWTimeout:
+                pass
             except Exception:
-                print(f"Size selection not available for '{keywords}'. Skipping size selection.")
+                pass
+
+            print(f"Item '{keywords}' not found. Refreshing with jitter...")
+            time.sleep(random.uniform(5, 15))
+            page.reload(wait_until="networkidle")
+
+        if not found:
+            print(f"Error: Could not find '{keywords}' after timeout. Skipping item.")
+            return False
+
+        # Optional size selection (example using a <select>)
+        if size and size.lower() not in ("one size", "onesize"):
+            try:
+                # Wait for a select to appear; replace with your site’s selector
+                size_select = page.get_by_test_id('size-dropdown')
+                size_select.wait_for(state="visible", timeout=5000)
+                size_select.click()
+                size_select.select_option(label=size)
+                print(f"Size '{size}' selected for '{keywords}'.")
+            except PWTimeout:
+                print(f"Size select not available for '{keywords}'. Skipping size selection.")
+            except Exception:
+                # Optionally enumerate options:
+                try:
+                    opts = size_select.locator("option").all_inner_texts()
+                    print(f"Could not match size '{size}'. Available: {opts}")
+                except Exception:
+                    pass
+                return False
         else:
             print(f"No size selection needed for '{keywords}'.")
 
-        # Add to cart
-        atc_button = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//button[@data-testid="add-to-cart-button"]'))
-        )
-        atc_button.click()
-        print(f"Clicked 'Add to Cart' button for '{keywords}'.")
+        # Click Add to Cart (replace with a stable selector from your site)
+        atc_btn = page.locator(
+            "[data-testid='add-to-cart-button'], button:has-text('Add to cart'), button:has-text('Add to Cart')"
+        ).first
+        atc_btn.wait_for(state="visible", timeout=10000)
 
-        # Wait until the button changes to "remove-from-cart-button"
-        WebDriverWait(driver, 10).until(
-            EC.presence_of_element_located((By.XPATH, '//button[@data-testid="remove-from-cart-button"]'))
-        )
+        def is_atc_response(resp):
+            # Fast server-ack: proceed when the ATC request gets a 2xx response
+            return (
+                resp.request.method in ("POST", "PUT")
+                and any(p in resp.url for p in ("/cart", "/api/cart", "add_to_cart"))
+                and 200 <= resp.status < 300
+            )
+
+        # Click and block until the server *acknowledges* the add-to-cart
+        with page.expect_response(is_atc_response, timeout=15000):
+            atc_btn.click()
+        print(f"Clicked 'Add to Cart' for '{keywords}' (server acknowledged).")
+        # Wait for evidence of success (e.g., cart badge updates or change of button)
+        page.wait_for_selector("[data-testid='remove-from-cart-button'], .cart-count, .mini-cart", timeout=10000)
         print(f"Item '{keywords}' successfully added to cart.")
+        return True
+
     except Exception as e:
-        print(f"Could not add '{keywords}' to cart")
+        print(f"Could not add '{keywords}' to cart: {e}")
+        return False
 
-
-def click_checkout():
-    """Clicks the checkout button."""
+def click_checkout(page):
+    """Navigate to checkout. Replace selector/URL with your permitted site’s flow."""
     try:
-        checkout_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, "//a[@aria-label='Supreme Checkout']"))
-        )
-        checkout_btn.click()
+        # Example: a header/cart link
+        checkout = page.locator("a[aria-label*='Checkout'], a:has-text('Checkout')")
+        checkout.first.click()
         print("Checkout initiated.")
     except Exception as e:
         print(f"Error clicking checkout button: {e}")
 
+from playwright.sync_api import Page
 
-def fill_info():
-    """Fills in the checkout information, including payment details."""
+def fill_info(page: Page):
+    """
+    Fill checkout info using element IDs and per-field card iframes.
+    Use ONLY in your own sandbox/test environment.
+    """
     try:
-        # Personal Information
+        # --- Personal info (top-level doc) ---
         fields = {
-            "email": '//*[@id="email"]',
-            "first_name": '//*[@id="TextField0"]',
-            "last_name": '//*[@id="TextField1"]',
-            "address": '//*[@id="shipping-address1"]',
-            "city": '//*[@id="TextField3"]',
-            "state": '//*[@id="Select1"]',
-            "zip_code": '//*[@id="TextField4"]',
-            "phone": '//*[@id="TextField5"]'
+            "email": "#email",
+            "first_name": "#TextField0",
+            "last_name": "#TextField1",
+            "address": "#shipping-address1",
+            "city": "#TextField3",
+            "state": "#Select1",        # <select>
+            "zip_code": "#TextField4",
+            "phone": "#TextField5",
         }
         data = {
             "email": "exampleEmail@gmail.com",
@@ -139,93 +252,110 @@ def fill_info():
             "last_name": "Doe",
             "address": "123 Test Ln",
             "city": "Testing Meadows",
-            "state": "Illinois",
+            "state": "Illinois",        # label in the select
             "zip_code": "60007",
-            "phone": "1234567890"
+            "phone": "1234567890",
         }
-        for field, xpath in fields.items():
-            input_field = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, xpath)))
-            input_field.send_keys(data[field])
-            # time.sleep(random.uniform(0.5, 1))  # Random pause to avoid detection
 
-        # Payment Information
-        iframe_info = {
-            "card_number": "number",
-            "expiry": "expiry",
-            "verification_value": "verification_value",
-            "name": "name"
-        }
-        input_data = {
-            "card_number": "1234123412341234",
-            "expiry": "1234",  # MMYY format
-            "verification_value": "000",
-            "name": "John Doe"
-        }
-        print("Sleeping...")
-        time.sleep(1)
-        for field, field_id in iframe_info.items():
-            iframe = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, f'//iframe[starts-with(@id, "card-fields-{field_id}-")]'))
-            )
-            driver.switch_to.frame(iframe)
-
-            input_field = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, f'//*[@id="{field_id}"]'))
-            )
-
-            if field == "expiry":
-                input_field.send_keys(input_data[field][:2])  # MM
-                time.sleep(random.uniform(0.5, 1))
-                input_field.send_keys(input_data[field][2:])  # YY
+        for key, sel in fields.items():
+            loc = page.locator(sel).first
+            # Wait for it to be attached & visible
+            loc.wait_for(state="visible", timeout=15000)
+            loc.scroll_into_view_if_needed()
+            if key == "state":
+                # select dropdown by label (or use value="IL" if that's what the DOM has)
+                loc.select_option(label=data[key])
             else:
-                input_field.send_keys(input_data[field])
+                # Some masked inputs ignore .fill(); typing is more reliable
+                loc.click()
+                loc.press_sequentially(str(data[key]), delay=20)
+        print("Personal information filled.")
 
-            # time.sleep(random.uniform(0.5, 1))  # Random pause
-            driver.switch_to.default_content()
+        # --- Payment info (each field inside its own iframe) ---
+        # Matches <iframe id="card-fields-number-XXXX">, etc.
+        card_iframes = {
+            "card_number": ("number", "4111111111111111"),
+            "expiry": ("expiry", "1234"),               # MMYY
+            "verification_value": ("verification_value", "000"),
+            "name": ("name", "John Doe"),
+        }
 
-        print("Checkout information entered.")
+        for logical, (field_id, value) in card_iframes.items():
+            frame = page.frame_locator(f"iframe[id^='card-fields-{field_id}-']").first
+            # Wait for the iframe to be present and the inner input ready
+            input_box = frame.locator(f"#{field_id}").first
+            input_box.wait_for(state="visible", timeout=15000)
+            input_box.scroll_into_view_if_needed()
+            input_box.click()
+
+            if field_id == "expiry":
+                # Type MM then YY like your Selenium code
+                mm, yy = value[:2], value[2:]
+                input_box.press_sequentially(mm, delay=40)
+                input_box.press_sequentially(yy, delay=40)
+            else:
+                # Masked inputs prefer sequential typing over fill()
+                input_box.press_sequentially(value, delay=20)
+
+        print("Payment information filled (test data).")
+
     except Exception as e:
         print(f"Error filling checkout details: {e}")
 
 
-def send_order():
-    """Clicks the pay button to finalize the order."""
+
+def send_order(page):
+    """Submit the order in a test environment you control."""
     try:
-        payment_btn = WebDriverWait(driver, 10).until(
-            EC.element_to_be_clickable((By.XPATH, '//*[@id="checkout-pay-button"]'))
-        )
-        payment_btn.click()
-        print("Order submitted successfully.")
+        pay_btn = page.locator("#checkout-pay-button, button:has-text('Pay')")
+        pay_btn.first.click()
+        print("Order submitted (test).")
     except Exception as e:
         print(f"Error submitting order: {e}")
 
-
+# --- Orchestration ---
+# Switch to headless mode for production
 def buy(items):
     """
-    Handles the entire purchase process for multiple items, each with its own size.
+    items: list[tuple[str, str]] like [("Keyword A", "Large"), ("Keyword B", "One Size")]
     """
-    driver.get("https://us.supreme.com/collections/all")
-    captcha_check()
+    with sync_playwright() as p:
+        context = create_context(p)
+        page = context.new_page()
 
-    for item in items:
-        keywords, size = item  # Unpack keyword and size
-        add_item_to_cart(keywords, size)
-        captcha_check()
+        try:
+            page.goto("https://us.supreme.com/collections/new", wait_until="domcontentloaded")
+            captcha_check(page)
 
-        # Return to the main collections page if there are more items
-        if item != items[-1]:
-            driver.get("https://us.supreme.com/collections/all")
-            WebDriverWait(driver, 10).until(
-                lambda d: d.execute_script('return document.readyState') == 'complete'
-            )
-            captcha_check()
+            # Monitor for the drop using the first item's keywords
+            if items:
+                wait_for_drop(page, items[0][0])
 
-    # Proceed to checkout
-    click_checkout()
-    captcha_check()
+            for idx, (keywords, size) in enumerate(items):
+                success = add_item_to_cart(page, keywords, size)
+                results_queue.put((keywords, success))
+                captcha_check(page)
 
-    fill_info()
-    send_order()
+                if idx < len(items) - 1:
+                    page.goto("https://us.supreme.com/collections/new", wait_until="domcontentloaded")
+                    captcha_check(page)
 
-    time.sleep(1000)
+            failed_items = []
+            while not results_queue.empty():
+                item, success = results_queue.get()
+                if not success:
+                    failed_items.append(item)
 
+            if failed_items:
+                print(f"Failed to add items to cart: {failed_items}")
+                return
+
+            click_checkout(page)
+            captcha_check(page)
+            fill_info(page)
+            send_order(page)
+            time.sleep(9999)
+            page.wait_for_timeout(2000)
+
+        finally:
+            context.close()
